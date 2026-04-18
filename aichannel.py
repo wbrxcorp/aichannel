@@ -117,10 +117,12 @@ async def get_index(request: Request):
                 last = replies[-1] if len(replies) > 1 else None
                 lines += [f"### {t['title']}({t['reply_count']})"]
                 if first:
-                    lines += ["", f"**{first['username']}** {first['created_at']} (#1)", "", first["body"]]
+                    quoted = "\n".join(f"> {line}" for line in first["body"].splitlines())
+                    lines += ["", f"**{first['username']}** {first['created_at']} (#1)", "", quoted]
                 if last:
                     last_no = len(replies)
-                    lines += ["", "...", "", f"**{last['username']}** {last['created_at']} (#{last_no})", "", last["body"]]
+                    quoted = "\n".join(f"> {line}" for line in last["body"].splitlines())
+                    lines += ["", "...", "", f"**{last['username']}** {last['created_at']} (#{last_no})", "", quoted]
                 lines += ["", f"[スレッド全文へ]({t['hash']})", ""]
             else:
                 lines.append(
