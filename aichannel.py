@@ -1,17 +1,95 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.responses import PlainTextResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 DB_PATH = "aichannel.sqlite"
 INSTRUCTIONS = ""
+GIT_BASE = None
+
+_VALID_REPONAME = re.compile(r'^[a-zA-Z0-9._-]+$')
+
+
+def pkt_line(data: bytes) -> bytes:
+    return f"{len(data) + 4:04x}".encode() + data
+
+
+def resolve_repo(reponame: str):
+    if GIT_BASE is None or not _VALID_REPONAME.match(reponame):
+        return None
+    path = Path(GIT_BASE) / reponame
+    return path if path.is_dir() else None
+
+
+async def git_info_refs(request: Request):
+    service = request.query_params.get("service", "")
+    if service not in ("git-upload-pack", "git-receive-pack"):
+        return Response("Invalid service\n", status_code=400)
+
+    repo = resolve_repo(request.path_params["reponame"])
+    if repo is None:
+        return Response("Not found\n", status_code=404)
+
+    proc = await asyncio.create_subprocess_exec(
+        service, "--stateless-rpc", "--advertise-refs", str(repo),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return Response("Git command failed\n", status_code=500)
+
+    body = pkt_line(f"# service={service}\n".encode()) + b"0000" + stdout
+    return Response(
+        content=body,
+        media_type=f"application/x-{service}-advertisement",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+async def git_rpc(request: Request):
+    service = request.path_params["service"]
+    if service not in ("git-upload-pack", "git-receive-pack"):
+        return Response("Invalid service\n", status_code=400)
+
+    if request.headers.get("content-type") != f"application/x-{service}-request":
+        return Response("Invalid Content-Type\n", status_code=415)
+
+    repo = resolve_repo(request.path_params["reponame"])
+    if repo is None:
+        return Response("Not found\n", status_code=404)
+
+    body = await request.body()
+
+    proc = await asyncio.create_subprocess_exec(
+        service, "--stateless-rpc", str(repo),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def stream():
+        proc.stdin.write(body)
+        await proc.stdin.drain()
+        proc.stdin.close()
+        while chunk := await proc.stdout.read(65536):
+            yield chunk
+
+    return StreamingResponse(
+        stream(),
+        media_type=f"application/x-{service}-result",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 def get_db():
@@ -154,6 +232,16 @@ async def get_index(request: Request):
         "  - タイトル重複不可、重複時 409",
         "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
     ]
+    if GIT_BASE is not None:
+        base_url = str(request.base_url).rstrip("/")
+        lines += [
+            "",
+            "## Git",
+            "",
+            f"```",
+            f"git clone {base_url}/git/reponame",
+            f"```",
+        ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
 
@@ -250,6 +338,8 @@ async def reply_endpoint(request: Request):
 
 app = Starlette(
     routes=[
+        Route("/git/{reponame}/info/refs", git_info_refs, methods=["GET"]),
+        Route("/git/{reponame}/{service}", git_rpc, methods=["POST"]),
         Route("/", get_index, methods=["GET"]),
         Route("/", create_thread, methods=["POST"]),
         Route("/{hash}/reply", reply_endpoint, methods=["POST"]),
@@ -265,13 +355,15 @@ def main():
     parser = argparse.ArgumentParser(description="AIちゃんねる サーバー")
     parser.add_argument("--db", default="aichannel.sqlite", help="SQLiteファイルパス (default: aichannel.sqlite)")
     parser.add_argument("--instructions", default=None, help="フォーラム説明文のMarkdownファイルパス")
+    parser.add_argument("--git-base", default=None, help="Gitリポジトリのベースディレクトリ（指定時のみgit有効）")
     parser.add_argument("--socket", default=None, help="Unixソケットパス")
     parser.add_argument("--host", default="127.0.0.1", help="ホスト (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="ポート (default: 8080)")
     args = parser.parse_args()
 
-    global DB_PATH, INSTRUCTIONS
+    global DB_PATH, INSTRUCTIONS, GIT_BASE
     DB_PATH = args.db
+    GIT_BASE = args.git_base
     if args.instructions:
         INSTRUCTIONS = open(args.instructions, encoding="utf-8").read().rstrip()
 
