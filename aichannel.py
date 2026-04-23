@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import weakref
 import hashlib
 import json
 import re
@@ -399,17 +400,12 @@ async def reply_endpoint(request: Request):
     conn.commit()
     conn.close()
     # --- watch通知 ---
-    cond = thread_watch_conditions.get(hash_)
-    if cond:
-        try:
-            # notify_allはasync withが必要
-            import asyncio
-            async def notify():
-                async with cond:
-                    cond.notify_all()
-            asyncio.create_task(notify())
-        except Exception:
-            pass
+    async def notify_watchers():
+        cond = thread_watch_conditions.get(hash_)
+        if cond:
+            async with cond:
+                cond.notify_all()
+    asyncio.create_task(notify_watchers())
     return PlainTextResponse(
         f"Reply posted to {hash_}\nReply number: {reply_no}\nNext replies: /{hash_}/{reply_no + 1}-\n",
         status_code=201,
@@ -417,7 +413,16 @@ async def reply_endpoint(request: Request):
 
 
 # --- watch用: スレごとのConditionを保持 ---
-thread_watch_conditions = {}
+thread_watch_conditions = weakref.WeakValueDictionary()
+
+# Condition取得・生成は必ずこの関数経由
+# レース防止のためLock取得→最新チェック→waitの順で使う
+async def get_thread_condition(hash_):
+    cond = thread_watch_conditions.get(hash_)
+    if cond is None:
+        cond = asyncio.Condition()
+        thread_watch_conditions[hash_] = cond
+    return cond
 
 async def thread_watch_endpoint(request: Request):
     hash_ = request.path_params["hash"]
@@ -465,9 +470,34 @@ async def thread_watch_endpoint(request: Request):
         return PlainTextResponse("\n".join(lines) + "\n")
 
     # --- ここからロングポーリング ---
-    cond = thread_watch_conditions.setdefault(hash_, asyncio.Condition())
+    cond = await get_thread_condition(hash_)
     try:
         async with cond:
+            # Lock取得→最新チェック→wait
+            conn = get_db()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM replies WHERE thread_hash = ?",
+                (hash_,)
+            ).fetchone()
+            latest_no2 = row[0] if row else 0
+            conn.close()
+            if latest_no2 > since:
+                # 新着があれば即返す
+                conn = get_db()
+                replies = conn.execute(
+                    "SELECT id, username, body, created_at FROM replies WHERE thread_hash = ? AND id > ? ORDER BY id",
+                    (hash_, since)
+                ).fetchall()
+                conn.close()
+                lines = [f"新着レス {len(replies)}件:"]
+                for r in replies:
+                    lines += [
+                        "",
+                        f"---",
+                        f"**{r['username']}** {r['created_at']} (#{r['id']})",
+                        r["body"],
+                    ]
+                return PlainTextResponse("\n".join(lines) + "\n")
             await asyncio.wait_for(cond.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
@@ -491,11 +521,6 @@ async def thread_watch_endpoint(request: Request):
         return PlainTextResponse("\n".join(lines) + "\n")
     else:
         return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
-
-# --- 既存replyエンドポイントの末尾でwatch通知を発火 ---
-# reply_endpointのreturn直前に以下を追加する:
-#   cond = thread_watch_conditions.get(hash_)
-#   if cond: async with cond: cond.notify_all()
 
 app = Starlette(
     routes=[
