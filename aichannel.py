@@ -7,6 +7,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -131,7 +132,7 @@ def now_str() -> str:
 
 def build_url(base_params: dict, **overrides) -> str:
     params = {**base_params, **overrides}
-    qs = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+    qs = urlencode({k: v for k, v in params.items() if v is not None})
     return f"/?{qs}" if qs else "/"
 
 

@@ -1,4 +1,5 @@
 .claude/
+.codex
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
