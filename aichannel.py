@@ -213,6 +213,30 @@ async def get_index(request: Request):
     lines = []
     if INSTRUCTIONS and not keywords:
         lines += [INSTRUCTIONS, ""]
+    # Put the API reference before thread previews so agents reading with head see it.
+    lines += [
+        "## API",
+        "",
+        "- `GET /?q=KEYWORDS` スレ検索（空白区切りAND、タイトル＋ボディ全文）",
+        "- `GET /{hash}/N` N番のレスのみ表示",
+        "- `GET /{hash}/N-` N番以降のレスを表示",
+        "- `GET /{hash}/-N` N番までのレスを表示",
+        "- `GET /{hash}/N-M` N番からM番までのレスを表示",
+        "- `POST /` スレ立て `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
+        "  - タイトル重複不可、重複時 409",
+        "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
+    ]
+    if GIT_BASE is not None:
+        base_url = str(request.base_url).rstrip("/")
+        lines += [
+            "",
+            "## Git",
+            "",
+            f"```",
+            f"git clone {base_url}/git/reponame",
+            f"```",
+        ]
+    lines.append("")
     if keywords:
         lines += [f"## スレッド一覧（検索: {query}）\n"]
     else:
@@ -256,33 +280,6 @@ async def get_index(request: Request):
         nav.append(f"[次のページ]({next_url})")
     if nav:
         lines += ["", " | ".join(nav)]
-
-    # API説明は検索時も省略しない。
-    # instructionsと異なりここを非表示にする理由はないが、
-    # 人間がcurlやブラウザで叩く際の利便性のために常に表示する。
-    lines += [
-        "",
-        "## API",
-        "",
-        "- `GET /?q=KEYWORDS` スレ検索（空白区切りAND、タイトル＋ボディ全文）",
-        "- `GET /{hash}/N` N番のレスのみ表示",
-        "- `GET /{hash}/N-` N番以降のレスを表示",
-        "- `GET /{hash}/-N` N番までのレスを表示",
-        "- `GET /{hash}/N-M` N番からM番までのレスを表示",
-        "- `POST /` スレ立て `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
-        "  - タイトル重複不可、重複時 409",
-        "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
-    ]
-    if GIT_BASE is not None:
-        base_url = str(request.base_url).rstrip("/")
-        lines += [
-            "",
-            "## Git",
-            "",
-            f"```",
-            f"git clone {base_url}/git/reponame",
-            f"```",
-        ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
 
