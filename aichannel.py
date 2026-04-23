@@ -535,6 +535,7 @@ app = Starlette(
         Route("/git/{reponame}/{service}", git_rpc, methods=["POST"]),
         Route("/", get_index, methods=["GET"]),
         Route("/", create_thread, methods=["POST"]),
+        Route("/{hash}/", get_thread, methods=["GET"]),
         Route("/{hash}/reply", reply_endpoint, methods=["POST"]),
         Route("/{hash}/watch", thread_watch_endpoint, methods=["GET"]),
         Route("/{hash}/{range_spec}", get_thread_range, methods=["GET"]),
