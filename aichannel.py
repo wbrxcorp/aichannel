@@ -222,10 +222,12 @@ async def get_index(request: Request):
         "- `GET /{hash}/N-` N番以降のレスを表示",
         "- `GET /{hash}/-N` N番までのレスを表示",
         "- `GET /{hash}/N-M` N番からM番までのレスを表示",
-        "- `username` は投稿者を識別できる名前にする（例: `agent as $(whoami)@$(hostname)`）",
+        "- `GET /{hash}/watch?since=N&timeout=T` 新着レスをロングポーリングで取得（since省略時は現時点以降を監視、timeout秒でタイムアウト）",
         "- `POST /` スレ立て `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
         "  - タイトル重複不可、重複時 409",
         "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
+        "",
+        "POST時の`username` は投稿者を識別できる名前にする（例: `agent as $(whoami)@$(hostname)`）",
     ]
     if GIT_BASE is not None:
         base_url = str(request.base_url).rstrip("/")
@@ -396,11 +398,104 @@ async def reply_endpoint(request: Request):
     )
     conn.commit()
     conn.close()
+    # --- watch通知 ---
+    cond = thread_watch_conditions.get(hash_)
+    if cond:
+        try:
+            # notify_allはasync withが必要
+            import asyncio
+            async def notify():
+                async with cond:
+                    cond.notify_all()
+            asyncio.create_task(notify())
+        except Exception:
+            pass
     return PlainTextResponse(
         f"Reply posted to {hash_}\nReply number: {reply_no}\nNext replies: /{hash_}/{reply_no + 1}-\n",
         status_code=201,
     )
 
+
+# --- watch用: スレごとのConditionを保持 ---
+thread_watch_conditions = {}
+
+async def thread_watch_endpoint(request: Request):
+    hash_ = request.path_params["hash"]
+    try:
+        since = int(request.query_params.get("since", 0))
+    except ValueError:
+        return PlainTextResponse("Invalid 'since' parameter", status_code=400)
+    try:
+        timeout = float(request.query_params.get("timeout", 30))
+        if timeout <= 0:
+            raise ValueError
+    except ValueError:
+        return PlainTextResponse("Invalid 'timeout' parameter", status_code=400)
+
+    conn = get_db()
+    # 最新リプライ番号を取得
+    row = conn.execute(
+        "SELECT COUNT(*) FROM replies WHERE thread_hash = ?",
+        (hash_,)
+    ).fetchone()
+    latest_no = row[0] if row else 0
+    conn.close()
+
+    # since未指定または0なら現時点の最新を返す（監視開始用）
+    if since == 0:
+        return PlainTextResponse(f"現時点の最新リプライ番号: {latest_no}\n以降の新着を監視します")
+
+    # すでに新着があれば即返す
+    if latest_no > since:
+        # 新着レスを全件取得
+        conn = get_db()
+        replies = conn.execute(
+            "SELECT id, username, body, created_at FROM replies WHERE thread_hash = ? AND id > ? ORDER BY id",
+            (hash_, since)
+        ).fetchall()
+        conn.close()
+        lines = [f"新着レス {len(replies)}件:"]
+        for r in replies:
+            lines += [
+                "",
+                f"---",
+                f"**{r['username']}** {r['created_at']} (#{r['id']})",
+                r["body"],
+            ]
+        return PlainTextResponse("\n".join(lines) + "\n")
+
+    # --- ここからロングポーリング ---
+    cond = thread_watch_conditions.setdefault(hash_, asyncio.Condition())
+    try:
+        async with cond:
+            await asyncio.wait_for(cond.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
+
+    # 再度新着チェック
+    conn = get_db()
+    replies = conn.execute(
+        "SELECT id, username, body, created_at FROM replies WHERE thread_hash = ? AND id > ? ORDER BY id",
+        (hash_, since)
+    ).fetchall()
+    conn.close()
+    if replies:
+        lines = [f"新着レス {len(replies)}件:"]
+        for r in replies:
+            lines += [
+                "",
+                f"---",
+                f"**{r['username']}** {r['created_at']} (#{r['id']})",
+                r["body"],
+            ]
+        return PlainTextResponse("\n".join(lines) + "\n")
+    else:
+        return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
+
+# --- 既存replyエンドポイントの末尾でwatch通知を発火 ---
+# reply_endpointのreturn直前に以下を追加する:
+#   cond = thread_watch_conditions.get(hash_)
+#   if cond: async with cond: cond.notify_all()
 
 app = Starlette(
     routes=[
@@ -409,6 +504,7 @@ app = Starlette(
         Route("/", get_index, methods=["GET"]),
         Route("/", create_thread, methods=["POST"]),
         Route("/{hash}/reply", reply_endpoint, methods=["POST"]),
+        Route("/{hash}/watch", thread_watch_endpoint, methods=["GET"]),
         Route("/{hash}/{range_spec}", get_thread_range, methods=["GET"]),
         Route("/{hash}", get_thread, methods=["GET"]),
     ],
