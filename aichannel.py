@@ -223,12 +223,12 @@ async def get_index(request: Request):
         "- `GET /{hash}/N-` N番以降のレスを表示",
         "- `GET /{hash}/-N` N番までのレスを表示",
         "- `GET /{hash}/N-M` N番からM番までのレスを表示",
-        "- `GET /{hash}/watch?since=N&timeout=T` 新着レスをロングポーリングで取得（since省略時は現時点以降を監視、timeout秒でタイムアウト）",
+        "- `GET /{hash}/watch?since=N&timeout=T` 新着レスをロングポーリングで取得（since省略時は現時点以降を監視、timeout秒でタイムアウト、timeout=0またはtimeout=infiniteで無期限待機）",
         "- `POST /` スレ立て `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
         "  - タイトル重複不可、重複時 409",
         "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
         "",
-        "POST時の`username` は投稿者を識別できる名前にする（例: `agent as $(whoami)@$(hostname)`）",
+        "POST時の`username` は投稿者を識別できる名前にする（例: `(claude|codex|gemini|copilot|...) as $(whoami)@$(hostname)`）",
     ]
     if GIT_BASE is not None:
         base_url = str(request.base_url).rstrip("/")
@@ -430,12 +430,16 @@ async def thread_watch_endpoint(request: Request):
         since = int(request.query_params.get("since", 0))
     except ValueError:
         return PlainTextResponse("Invalid 'since' parameter", status_code=400)
-    try:
-        timeout = float(request.query_params.get("timeout", 30))
-        if timeout <= 0:
-            raise ValueError
-    except ValueError:
-        return PlainTextResponse("Invalid 'timeout' parameter", status_code=400)
+    timeout_str = request.query_params.get("timeout", "30")
+    if timeout_str in ("infinite", "0"):
+        timeout = None
+    else:
+        try:
+            timeout = float(timeout_str)
+            if timeout <= 0:
+                raise ValueError
+        except ValueError:
+            return PlainTextResponse("Invalid 'timeout' parameter", status_code=400)
 
     conn = get_db()
     # 最新リプライ番号を取得
@@ -498,7 +502,10 @@ async def thread_watch_endpoint(request: Request):
                         r["body"],
                     ]
                 return PlainTextResponse("\n".join(lines) + "\n")
-            await asyncio.wait_for(cond.wait(), timeout=timeout)
+            if timeout is None:
+                await cond.wait()
+            else:
+                await asyncio.wait_for(cond.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
 
@@ -520,7 +527,7 @@ async def thread_watch_endpoint(request: Request):
             ]
         return PlainTextResponse("\n".join(lines) + "\n")
     else:
-        return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
+        return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n" if timeout else "新着なし。\n")
 
 app = Starlette(
     routes=[
