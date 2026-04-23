@@ -94,6 +94,7 @@ async def git_rpc(request: Request):
 
 
 def get_db():
+    # TODO: Wrap DB usage in a context manager so connections close on exceptions.
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -134,6 +135,41 @@ def build_url(base_params: dict, **overrides) -> str:
     params = {**base_params, **overrides}
     qs = urlencode({k: v for k, v in params.items() if v is not None})
     return f"/?{qs}" if qs else "/"
+
+
+def parse_reply_range(range_spec: str):
+    if match := re.fullmatch(r"(\d+)", range_spec):
+        start = end = int(match.group(1))
+    elif match := re.fullmatch(r"(\d+)-", range_spec):
+        start, end = int(match.group(1)), None
+    elif match := re.fullmatch(r"-(\d+)", range_spec):
+        start, end = 1, int(match.group(1))
+    elif match := re.fullmatch(r"(\d+)-(\d+)", range_spec):
+        start, end = int(match.group(1)), int(match.group(2))
+    else:
+        return None
+
+    if start < 1 or (end is not None and (end < 1 or start > end)):
+        return None
+    return start, end
+
+
+def render_thread(thread, numbered_replies, range_spec=None):
+    lines = [f"# {thread['title']}"]
+    if range_spec is not None:
+        lines += ["", f"表示範囲: {range_spec}"]
+    if not numbered_replies:
+        lines += ["", "*該当レスはありません*"]
+    for i, r in numbered_replies:
+        lines += [
+            "",
+            "---",
+            "",
+            f"**{r['username']}** {r['created_at']} (#{i})",
+            "",
+            r["body"],
+        ]
+    return PlainTextResponse("\n".join(lines) + "\n")
 
 
 async def get_index(request: Request):
@@ -189,7 +225,7 @@ async def get_index(request: Request):
             if offset == 0 and i < 3:
                 # 最新3スレッドは展開表示：スレ立てレスと最新レスをプレビュー
                 replies = conn2.execute(
-                    "SELECT username, body, created_at FROM replies WHERE thread_hash = ? ORDER BY created_at",
+                    "SELECT username, body, created_at FROM replies WHERE thread_hash = ? ORDER BY id",
                     (t["hash"],),
                 ).fetchall()
                 first = replies[0] if replies else None
@@ -229,6 +265,10 @@ async def get_index(request: Request):
         "## API",
         "",
         "- `GET /?q=KEYWORDS` スレ検索（空白区切りAND、タイトル＋ボディ全文）",
+        "- `GET /{hash}/N` N番のレスのみ表示",
+        "- `GET /{hash}/N-` N番以降のレスを表示",
+        "- `GET /{hash}/-N` N番までのレスを表示",
+        "- `GET /{hash}/N-M` N番からM番までのレスを表示",
         "- `POST /` スレ立て `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
         "  - タイトル重複不可、重複時 409",
         "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
@@ -273,7 +313,10 @@ async def create_thread(request: Request):
     )
     conn.commit()
     conn.close()
-    return PlainTextResponse(f"Thread created: {hash_}\n", status_code=201)
+    return PlainTextResponse(
+        f"Thread created: {hash_}\nReply number: 1\nNext replies: /{hash_}/2-\n",
+        status_code=201,
+    )
 
 
 async def get_thread(request: Request):
@@ -285,22 +328,39 @@ async def get_thread(request: Request):
         return JSONResponse({"detail": "Thread not found"}, status_code=404)
 
     replies = conn.execute(
-        "SELECT * FROM replies WHERE thread_hash = ? ORDER BY created_at",
+        "SELECT * FROM replies WHERE thread_hash = ? ORDER BY id",
+        (hash_,),
+    ).fetchall()
+    conn.close()
+    return render_thread(thread, list(enumerate(replies, 1)))
+
+
+async def get_thread_range(request: Request):
+    hash_ = request.path_params["hash"]
+    range_spec = request.path_params["range_spec"]
+    parsed = parse_reply_range(range_spec)
+    if parsed is None:
+        return JSONResponse({"detail": "Invalid reply range"}, status_code=400)
+    start, end = parsed
+
+    conn = get_db()
+    thread = conn.execute("SELECT * FROM threads WHERE hash = ?", (hash_,)).fetchone()
+    if not thread:
+        conn.close()
+        return JSONResponse({"detail": "Thread not found"}, status_code=404)
+
+    replies = conn.execute(
+        "SELECT * FROM replies WHERE thread_hash = ? ORDER BY id",
         (hash_,),
     ).fetchall()
     conn.close()
 
-    lines = [f"# {thread['title']}"]
-    for i, r in enumerate(replies, 1):
-        lines += [
-            "",
-            "---",
-            "",
-            f"**{r['username']}** {r['created_at']} (#{i})",
-            "",
-            r["body"],
-        ]
-    return PlainTextResponse("\n".join(lines) + "\n")
+    numbered_replies = [
+        (i, r)
+        for i, r in enumerate(replies, 1)
+        if i >= start and (end is None or i <= end)
+    ]
+    return render_thread(thread, numbered_replies, range_spec=range_spec)
 
 
 async def reply_endpoint(request: Request):
@@ -324,17 +384,24 @@ async def reply_endpoint(request: Request):
         return JSONResponse({"detail": f"Invalid request: {e}"}, status_code=400)
 
     ts = now_str()
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO replies (thread_hash, username, body, created_at) VALUES (?,?,?,?)",
         (hash_, username, body, ts),
     )
+    reply_no = conn.execute(
+        "SELECT COUNT(*) FROM replies WHERE thread_hash = ? AND id <= ?",
+        (hash_, cur.lastrowid),
+    ).fetchone()[0]
     conn.execute(
         "UPDATE threads SET last_reply_at = ? WHERE hash = ?",
         (ts, hash_),
     )
     conn.commit()
     conn.close()
-    return PlainTextResponse(f"Reply posted to {hash_}\n", status_code=201)
+    return PlainTextResponse(
+        f"Reply posted to {hash_}\nReply number: {reply_no}\nNext replies: /{hash_}/{reply_no + 1}-\n",
+        status_code=201,
+    )
 
 
 app = Starlette(
@@ -344,6 +411,7 @@ app = Starlette(
         Route("/", get_index, methods=["GET"]),
         Route("/", create_thread, methods=["POST"]),
         Route("/{hash}/reply", reply_endpoint, methods=["POST"]),
+        Route("/{hash}/{range_spec}", get_thread_range, methods=["GET"]),
         Route("/{hash}", get_thread, methods=["GET"]),
     ],
     on_startup=[init_db],
