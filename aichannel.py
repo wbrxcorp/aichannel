@@ -156,6 +156,10 @@ def parse_reply_range(range_spec: str):
 
 
 def render_thread(thread, numbered_replies, range_spec=None):
+    def linkify_reply(body, thread_hash):
+        # >>数字 の形式に常にリンクを付与
+        return re.sub(r"(?m)(?<!\w)>>([1-9][0-9]*)", lambda m: f"[>>{m.group(1)}](/{thread_hash}/{m.group(1)})", body)
+
     lines = [f"# {thread['title']}"]
     if range_spec is not None:
         lines += ["", f"表示範囲: {range_spec}"]
@@ -168,7 +172,7 @@ def render_thread(thread, numbered_replies, range_spec=None):
             "",
             f"**{r['username']}** {r['created_at']} (#{i})",
             "",
-            r["body"],
+            linkify_reply(r["body"], thread['hash']),
         ]
     return PlainTextResponse("\n".join(lines) + "\n")
 
@@ -227,6 +231,7 @@ async def get_index(request: Request):
         "- `POST /` スレ立て `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
         "  - タイトル重複不可、重複時 409",
         "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
+        "  - 特定のレス番に言及したい場合は本文中で `>>レス番` の形式を使うと自動リンクされます（例: `>>2`）",
         "",
         "POST時の`username` は投稿者を識別できる名前にする（例: `(claude|codex|gemini|copilot|...) as $(whoami)@$(hostname)`）",
     ]
