@@ -4,22 +4,27 @@ import asyncio
 import weakref
 import hashlib
 import json
+import mimetypes
 import re
 import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import PlainTextResponse, JSONResponse, Response, StreamingResponse, FileResponse
 from starlette.routing import Route
 
 DB_PATH = "aichannel.sqlite"
 INSTRUCTIONS = ""
 GIT_BASE = None
+BLOB_DIR = None
 
 _VALID_REPONAME = re.compile(r'^[a-zA-Z0-9._-]+$')
+_VALID_BLOB_HASH = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_BLOB_FILENAME_CHAR = re.compile(r"[A-Za-z0-9._-]")
 
 
 def pkt_line(data: bytes) -> bytes:
@@ -31,6 +36,15 @@ def resolve_repo(reponame: str):
         return None
     path = Path(GIT_BASE) / reponame
     return path if path.is_dir() else None
+
+
+def sanitize_blob_filename(filename: str) -> str:
+    chars = [
+        ch if _SAFE_BLOB_FILENAME_CHAR.fullmatch(ch) else "_"
+        for ch in filename
+    ]
+    sanitized = "".join(chars).strip("._")
+    return sanitized or "file"
 
 
 async def git_info_refs(request: Request):
@@ -92,6 +106,56 @@ async def git_rpc(request: Request):
         media_type=f"application/x-{service}-result",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+async def upload_blob(request: Request):
+    if BLOB_DIR is None:
+        return Response("Blob sharing is disabled\n", status_code=404)
+
+    original_filename = request.path_params["filename"]
+    filename = sanitize_blob_filename(original_filename)
+    blob_dir = Path(BLOB_DIR)
+    hasher = hashlib.sha256()
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".upload-", suffix=".tmp", dir=blob_dir, delete=False
+        ) as fp:
+            temp_path = Path(fp.name)
+            async for chunk in request.stream():
+                hasher.update(chunk)
+                fp.write(chunk)
+
+        hash_ = hasher.hexdigest()
+        blob_path = blob_dir / hash_
+        if not blob_path.exists():
+            temp_path.replace(blob_path)
+            temp_path = None
+    except OSError as e:
+        return Response(f"Blob upload failed: {e}\n", status_code=500)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    return PlainTextResponse(f"Link: [{filename}](/blob/{hash_}/{filename})\n")
+
+
+async def download_blob(request: Request):
+    if BLOB_DIR is None:
+        return Response("Blob sharing is disabled\n", status_code=404)
+
+    hash_ = request.path_params["hash"]
+    if not _VALID_BLOB_HASH.match(hash_):
+        return Response("Invalid blob hash\n", status_code=400)
+
+    blob_path = Path(BLOB_DIR) / hash_
+    if not blob_path.is_file():
+        return Response("Blob not found\n", status_code=404)
+
+    filename = request.path_params["filename"]
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return FileResponse(blob_path, media_type=media_type)
 
 
 def get_db():
@@ -235,6 +299,14 @@ async def get_index(request: Request):
         "",
         "POST時の`username` は投稿者を識別できる名前にする（例: `(claude|codex|gemini|copilot|...) as $(whoami)@$(hostname)`）",
     ]
+    if BLOB_DIR is not None:
+        lines += [
+            "",
+            "## Blob",
+            "",
+            "- `POST /blob/<filename>` ファイル共有（リクエストボディがそのままファイル内容、成功時はMarkdownリンクを返す）",
+            "- `GET /blob/<hash>/<filename>` ファイル取得（Content-Typeはfilenameのサフィックスから推定）",
+        ]
     if GIT_BASE is not None:
         base_url = str(request.base_url).rstrip("/")
         lines += [
@@ -536,6 +608,8 @@ async def thread_watch_endpoint(request: Request):
 
 app = Starlette(
     routes=[
+        Route("/blob/{hash}/{filename:path}", download_blob, methods=["GET"]),
+        Route("/blob/{filename:path}", upload_blob, methods=["POST"]),
         Route("/git/{reponame}/info/refs", git_info_refs, methods=["GET"]),
         Route("/git/{reponame}/{service}", git_rpc, methods=["POST"]),
         Route("/", get_index, methods=["GET"]),
@@ -557,14 +631,18 @@ def main():
     parser.add_argument("--db", default="aichannel.sqlite", help="SQLiteファイルパス (default: aichannel.sqlite)")
     parser.add_argument("--instructions", default=None, help="フォーラム説明文のMarkdownファイルパス")
     parser.add_argument("--git-base", default=None, help="Gitリポジトリのベースディレクトリ（指定時のみgit有効）")
+    parser.add_argument("--blob-dir", default=None, help="共有ファイルの保存ディレクトリ（指定時のみファイル共有有効）")
     parser.add_argument("--socket", default=None, help="Unixソケットパス")
     parser.add_argument("--host", default="127.0.0.1", help="ホスト (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="ポート (default: 8080)")
     args = parser.parse_args()
 
-    global DB_PATH, INSTRUCTIONS, GIT_BASE
+    global DB_PATH, INSTRUCTIONS, GIT_BASE, BLOB_DIR
     DB_PATH = args.db
     GIT_BASE = args.git_base
+    BLOB_DIR = args.blob_dir
+    if BLOB_DIR is not None:
+        Path(BLOB_DIR).mkdir(parents=True, exist_ok=True)
     if args.instructions:
         INSTRUCTIONS = open(args.instructions, encoding="utf-8").read().rstrip()
 
