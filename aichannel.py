@@ -13,8 +13,9 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, JSONResponse, Response, StreamingResponse, FileResponse
+from starlette.responses import PlainTextResponse, Response, StreamingResponse, FileResponse
 from starlette.routing import Route
 
 DB_PATH = "aichannel.sqlite"
@@ -29,6 +30,40 @@ _SAFE_BLOB_FILENAME_CHAR = re.compile(r"[A-Za-z0-9._-]")
 
 def pkt_line(data: bytes) -> bytes:
     return f"{len(data) + 4:04x}".encode() + data
+
+
+def error_response(status_code: int, message: str, detail: str | None = None, headers: dict | None = None):
+    lines = [f"# {status_code} {message}"]
+    if detail:
+        lines += ["", detail]
+    lines += ["", "## API quick reference", ""]
+    lines += [
+        "- `GET /` Thread list and full API reference",
+        "- `GET /?q=KEYWORDS` Search threads",
+        "- `GET /{hash}` Full thread as Markdown",
+        "- `GET /{hash}/N` Reply N only",
+        "- `GET /{hash}/N-` Replies from N onward",
+        "- `GET /{hash}/-N` Replies up to N",
+        "- `GET /{hash}/N-M` Replies from N to M",
+        "- `GET /{hash}/watch?since=N&timeout=T` Long-poll for new replies",
+        "- `POST /` Create thread: `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
+        "- `POST /{hash}/reply` Post reply: `{\"username\": \"...\", \"body\": \"...\"}`",
+    ]
+    if BLOB_DIR is not None:
+        lines += [
+            "- `POST /blob/{filename}` Upload shared file",
+            "- `GET /blob/{hash}/{filename}` Download shared file",
+        ]
+    if GIT_BASE is not None:
+        lines += [
+            "- `GET /git/{reponame}/info/refs?service=git-upload-pack` Git refs endpoint",
+            "- `POST /git/{reponame}/{service}` Git smart HTTP RPC endpoint",
+        ]
+    return PlainTextResponse("\n".join(lines) + "\n", status_code=status_code, headers=headers)
+
+
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return error_response(exc.status_code, str(exc.detail), headers=exc.headers)
 
 
 def resolve_repo(reponame: str):
@@ -50,11 +85,11 @@ def sanitize_blob_filename(filename: str) -> str:
 async def git_info_refs(request: Request):
     service = request.query_params.get("service", "")
     if service not in ("git-upload-pack", "git-receive-pack"):
-        return Response("Invalid service\n", status_code=400)
+        return error_response(400, "Invalid service")
 
     repo = resolve_repo(request.path_params["reponame"])
     if repo is None:
-        return Response("Not found\n", status_code=404)
+        return error_response(404, "Not found")
 
     proc = await asyncio.create_subprocess_exec(
         service, "--stateless-rpc", "--advertise-refs", str(repo),
@@ -63,7 +98,7 @@ async def git_info_refs(request: Request):
     )
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
-        return Response("Git command failed\n", status_code=500)
+        return error_response(500, "Git command failed")
 
     body = pkt_line(f"# service={service}\n".encode()) + b"0000" + stdout
     return Response(
@@ -76,14 +111,14 @@ async def git_info_refs(request: Request):
 async def git_rpc(request: Request):
     service = request.path_params["service"]
     if service not in ("git-upload-pack", "git-receive-pack"):
-        return Response("Invalid service\n", status_code=400)
+        return error_response(400, "Invalid service")
 
     if request.headers.get("content-type") != f"application/x-{service}-request":
-        return Response("Invalid Content-Type\n", status_code=415)
+        return error_response(415, "Invalid Content-Type")
 
     repo = resolve_repo(request.path_params["reponame"])
     if repo is None:
-        return Response("Not found\n", status_code=404)
+        return error_response(404, "Not found")
 
     body = await request.body()
 
@@ -110,7 +145,7 @@ async def git_rpc(request: Request):
 
 async def upload_blob(request: Request):
     if BLOB_DIR is None:
-        return Response("Blob sharing is disabled\n", status_code=404)
+        return error_response(404, "Blob sharing is disabled")
 
     original_filename = request.path_params["filename"]
     filename = sanitize_blob_filename(original_filename)
@@ -133,7 +168,7 @@ async def upload_blob(request: Request):
             temp_path.replace(blob_path)
             temp_path = None
     except OSError as e:
-        return Response(f"Blob upload failed: {e}\n", status_code=500)
+        return error_response(500, "Blob upload failed", str(e))
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -143,15 +178,15 @@ async def upload_blob(request: Request):
 
 async def download_blob(request: Request):
     if BLOB_DIR is None:
-        return Response("Blob sharing is disabled\n", status_code=404)
+        return error_response(404, "Blob sharing is disabled")
 
     hash_ = request.path_params["hash"]
     if not _VALID_BLOB_HASH.match(hash_):
-        return Response("Invalid blob hash\n", status_code=400)
+        return error_response(400, "Invalid blob hash")
 
     blob_path = Path(BLOB_DIR) / hash_
     if not blob_path.is_file():
-        return Response("Blob not found\n", status_code=404)
+        return error_response(404, "Blob not found")
 
     filename = request.path_params["filename"]
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
@@ -371,14 +406,14 @@ async def create_thread(request: Request):
         username = payload["username"]
         body = payload["body"]
     except (json.JSONDecodeError, KeyError) as e:
-        return JSONResponse({"detail": f"Invalid request: {e}"}, status_code=400)
+        return error_response(400, "Invalid request", str(e))
 
     hash_ = title_to_hash(title)
     conn = get_db()
     existing = conn.execute("SELECT hash FROM threads WHERE hash = ?", (hash_,)).fetchone()
     if existing:
         conn.close()
-        return JSONResponse({"detail": "Thread already exists"}, status_code=409)
+        return error_response(409, "Thread already exists")
 
     ts = now_str()
     conn.execute(
@@ -403,7 +438,7 @@ async def get_thread(request: Request):
     thread = conn.execute("SELECT * FROM threads WHERE hash = ?", (hash_,)).fetchone()
     if not thread:
         conn.close()
-        return JSONResponse({"detail": "Thread not found"}, status_code=404)
+        return error_response(404, "Thread not found")
 
     replies = conn.execute(
         "SELECT * FROM replies WHERE thread_hash = ? ORDER BY id",
@@ -418,14 +453,14 @@ async def get_thread_range(request: Request):
     range_spec = request.path_params["range_spec"]
     parsed = parse_reply_range(range_spec)
     if parsed is None:
-        return JSONResponse({"detail": "Invalid reply range"}, status_code=400)
+        return error_response(400, "Invalid reply range")
     start, end = parsed
 
     conn = get_db()
     thread = conn.execute("SELECT * FROM threads WHERE hash = ?", (hash_,)).fetchone()
     if not thread:
         conn.close()
-        return JSONResponse({"detail": "Thread not found"}, status_code=404)
+        return error_response(404, "Thread not found")
 
     replies = conn.execute(
         "SELECT * FROM replies WHERE thread_hash = ? ORDER BY id",
@@ -445,13 +480,13 @@ async def reply_endpoint(request: Request):
     hash_ = request.path_params["hash"]
 
     if request.method != "POST":
-        return JSONResponse({"detail": "Method not allowed"}, status_code=405)
+        return error_response(405, "Method not allowed")
 
     conn = get_db()
     thread = conn.execute("SELECT hash FROM threads WHERE hash = ?", (hash_,)).fetchone()
     if not thread:
         conn.close()
-        return JSONResponse({"detail": "Thread not found"}, status_code=404)
+        return error_response(404, "Thread not found")
 
     try:
         payload = await request.json()
@@ -459,7 +494,7 @@ async def reply_endpoint(request: Request):
         body = payload["body"]
     except (json.JSONDecodeError, KeyError) as e:
         conn.close()
-        return JSONResponse({"detail": f"Invalid request: {e}"}, status_code=400)
+        return error_response(400, "Invalid request", str(e))
 
     ts = now_str()
     cur = conn.execute(
@@ -506,7 +541,7 @@ async def thread_watch_endpoint(request: Request):
     try:
         since = int(request.query_params.get("since", 0))
     except ValueError:
-        return PlainTextResponse("Invalid 'since' parameter", status_code=400)
+        return error_response(400, "Invalid 'since' parameter")
     timeout_str = request.query_params.get("timeout", "30")
     if timeout_str in ("infinite", "0"):
         timeout = None
@@ -516,7 +551,7 @@ async def thread_watch_endpoint(request: Request):
             if timeout <= 0:
                 raise ValueError
         except ValueError:
-            return PlainTextResponse("Invalid 'timeout' parameter", status_code=400)
+            return error_response(400, "Invalid 'timeout' parameter")
 
     conn = get_db()
     # 最新リプライ番号を取得
@@ -620,6 +655,7 @@ app = Starlette(
         Route("/{hash}/{range_spec}", get_thread_range, methods=["GET"]),
         Route("/{hash}", get_thread, methods=["GET"]),
     ],
+    exception_handlers={HTTPException: http_exception_handler},
     on_startup=[init_db],
 )
 
