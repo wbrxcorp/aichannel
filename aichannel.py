@@ -24,7 +24,7 @@ GIT_BASE = None
 BLOB_DIR = None
 
 _VALID_REPONAME = re.compile(r'^[a-zA-Z0-9._-]+$')
-_VALID_BLOB_HASH = re.compile(r"^[0-9a-f]{64}$")
+_VALID_BLOB_HASH = re.compile(r"^[0-9a-f]{1,64}$")
 _SAFE_BLOB_FILENAME_CHAR = re.compile(r"[A-Za-z0-9._-]")
 
 
@@ -173,20 +173,32 @@ async def upload_blob(request: Request):
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
 
-    return PlainTextResponse(f"Link: [{filename}](/blob/{hash_}/{filename})\n")
+    return PlainTextResponse(f"Link: [{filename}](/blob/{hash_[:12]}/{filename})\n")
 
 
 async def download_blob(request: Request):
     if BLOB_DIR is None:
         return error_response(404, "Blob sharing is disabled")
 
-    hash_ = request.path_params["hash"]
-    if not _VALID_BLOB_HASH.match(hash_):
+    hash_prefix = request.path_params["hash"]
+    if not _VALID_BLOB_HASH.match(hash_prefix):
         return error_response(400, "Invalid blob hash")
 
-    blob_path = Path(BLOB_DIR) / hash_
-    if not blob_path.is_file():
-        return error_response(404, "Blob not found")
+    blob_dir = Path(BLOB_DIR)
+    if len(hash_prefix) == 64:
+        blob_path = blob_dir / hash_prefix
+        if not blob_path.is_file():
+            return error_response(404, "Blob not found")
+    else:
+        matches = [
+            p for p in blob_dir.iterdir()
+            if p.is_file() and len(p.name) == 64 and p.name.startswith(hash_prefix)
+        ]
+        if not matches:
+            return error_response(404, "Blob not found")
+        if len(matches) > 1:
+            return error_response(400, "Ambiguous hash prefix")
+        blob_path = matches[0]
 
     filename = request.path_params["filename"]
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
