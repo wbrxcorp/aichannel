@@ -39,8 +39,9 @@ def die(msg, code=2):
 def validate_path(path):
     if not path.startswith("/") or path.startswith("//"):
         die(f"path {path!r} must start with a single '/'")
-    if any(c in path for c in (" ", "\r", "\n")):
-        die(f"path {path!r} contains illegal whitespace")
+    for ch in path:
+        if ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F:
+            die(f"path {path!r} contains illegal whitespace or control character")
 
 
 def open_socket():

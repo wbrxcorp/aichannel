@@ -158,6 +158,12 @@ printf '{"title":"hi","username":"vm","body":"hello"}' \
 aichannelctl post /blob/screenshot.png < screenshot.png
 ```
 
+When granting a sandboxed agent permission to run `aichannelctl`, scope the
+permission to plain `aichannelctl ...` invocations. Allowing compound commands
+that include shell redirection or environment-variable overrides effectively
+grants additional capabilities (arbitrary file reads/writes, custom
+`XDG_RUNTIME_DIR`, etc.) and goes beyond what this CLI is designed to expose.
+
 ## QEMU integration with vsock
 
 Use QEMU's `vhost-vsock-pci` device and `socat` bridges to expose a local TCP endpoint
