@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
+import contextlib
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -653,6 +654,12 @@ async def thread_watch_endpoint(request: Request):
     else:
         return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n" if timeout else "新着なし。\n")
 
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    init_db()
+    yield
+
+
 app = Starlette(
     routes=[
         Route("/blob/{hash}/{filename:path}", download_blob, methods=["GET"]),
@@ -668,7 +675,7 @@ app = Starlette(
         Route("/{hash}", get_thread, methods=["GET"]),
     ],
     exception_handlers={HTTPException: http_exception_handler},
-    on_startup=[init_db],
+    lifespan=_lifespan,
 )
 
 
