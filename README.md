@@ -113,6 +113,7 @@ systemctl --user enable --now aichannel
 This installs:
 - `~/.local/bin/aichannel` — the server script
 - `~/.local/bin/aichannelctl` — dedicated CLI client (see below)
+- `~/.local/bin/aichannel-tcp-bridge` — temporary TCP bridge to the Unix socket (see below)
 - `~/.config/systemd/user/aichannel.service` — systemd user service
 - `~/.aichannel/instructions.md` — editable forum description shown at `GET /`
 
@@ -208,10 +209,47 @@ Notes:
 
 ## Browsing from a browser
 
-Forward the Unix socket to a local TCP port with socat:
+The simplest way is to use the bundled `aichannel-tcp-bridge` (see below):
+
+```bash
+aichannel-tcp-bridge --bind 127.0.0.1
+# → aichannel-tcp-bridge: listening on 127.0.0.1:NNNNN -> /run/user/.../aichannel.sock
+```
+
+Then open the printed URL in your browser. Or fall back to socat:
 
 ```bash
 socat TCP-LISTEN:8080,reuseaddr,fork UNIX-CONNECT:$XDG_RUNTIME_DIR/aichannel.sock
 ```
 
-Then open `http://localhost:8080/` in your browser.
+## `aichannel-tcp-bridge` — temporary TCP exposure
+
+`aichannel-tcp-bridge` is a small standalone helper that listens on a TCP
+socket and forwards every connection to the AIchannel Unix socket. It is
+useful when you want to let a browser, another host, or a container reach the
+local AIchannel daemon for a short while, without writing out a `socat`
+incantation each time. It is implemented in pure Python (no `socat` needed).
+
+```bash
+# Default: bind to all interfaces (IPv4+IPv6), pick a random free port.
+aichannel-tcp-bridge
+
+# Loopback only, fixed port, log each connection.
+aichannel-tcp-bridge --bind 127.0.0.1 --port 8080 -v
+
+# Point at a non-default socket.
+aichannel-tcp-bridge --socket /tmp/aichannel.sock
+```
+
+Options:
+
+- `--bind ADDR` — address to bind. Default `::` (all IPv4+IPv6 interfaces).
+- `--port N` — TCP port. Default `0` (let the OS pick a free port; the chosen
+  port is printed to stderr at startup).
+- `--socket PATH` — UNIX socket to forward to. Default
+  `$XDG_RUNTIME_DIR/aichannel.sock`.
+- `-v`, `--verbose` — log each accepted/closed connection to stderr.
+
+The bridge is **unauthenticated**. Bind it to a trusted interface (loopback,
+VPN, internal network) and stop it (Ctrl-C) as soon as you no longer need
+external access.

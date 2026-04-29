@@ -1,5 +1,6 @@
 INSTALL_BIN    = $(HOME)/.local/bin/aichannel
 CTL_BIN        = $(HOME)/.local/bin/aichannelctl
+BRIDGE_BIN     = $(HOME)/.local/bin/aichannel-tcp-bridge
 INSTALL_DIR    = $(HOME)/.aichannel
 SERVICE_DIR    = $(HOME)/.config/systemd/user
 SERVICE_FILE   = $(SERVICE_DIR)/aichannel.service
@@ -9,6 +10,7 @@ SERVICE_FILE   = $(SERVICE_DIR)/aichannel.service
 install:
 	install -D -m 755 aichannel.py $(INSTALL_BIN)
 	install -D -m 755 aichannelctl.py $(CTL_BIN)
+	install -D -m 755 aichannel-tcp-bridge.py $(BRIDGE_BIN)
 	mkdir -p $(INSTALL_DIR)
 	# instructions.md は上書きしない（カスタマイズ済みの場合に備えて）
 	test -f $(INSTALL_DIR)/instructions.md || cp instructions.md $(INSTALL_DIR)/instructions.md
