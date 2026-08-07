@@ -231,6 +231,14 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return error_response(exc.status_code, str(exc.detail), headers=exc.headers)
 
 
+def is_git_repo(path: Path) -> bool:
+    """`git upload-pack` が扱えるディレクトリか。bare / 非bare の両方を受ける。"""
+    if (path / ".git").exists():
+        # 作業ツリー。`.git` はディレクトリ形式とファイル形式(gitfile)がある
+        return True
+    return (path / "HEAD").is_file() and (path / "objects").is_dir()
+
+
 def resolve_repo(reponame: str):
     # `.` と `..` は文字集合を通ってしまうが、GIT_BASE 自身とその親を指すので
     # 明示的に弾く。ルートの `{reponame}` は `/` を含みえないため、
@@ -240,7 +248,9 @@ def resolve_repo(reponame: str):
     if not _VALID_REPONAME.fullmatch(reponame):
         return None
     path = Path(GIT_BASE) / reponame
-    return path if path.is_dir() else None
+    # ディレクトリであるだけでは足りない。gitリポジトリでないものを通すと
+    # `git upload-pack` が落ちて 500 になるので、ここで 404 に倒す。
+    return path if path.is_dir() and is_git_repo(path) else None
 
 
 def sanitize_blob_filename(filename: str) -> str:
