@@ -5,8 +5,11 @@ import weakref
 import hashlib
 import json
 import mimetypes
+import pwd
 import re
+import socket
 import sqlite3
+import struct
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -23,10 +26,164 @@ DB_PATH = "aichannel.sqlite"
 INSTRUCTIONS = ""
 GIT_BASE = None
 BLOB_DIR = None
+ENFORCE_PEER_IDENTITY = False
 
 _VALID_REPONAME = re.compile(r'^[a-zA-Z0-9._-]+$')
 _VALID_BLOB_HASH = re.compile(r"^[0-9a-f]{1,64}$")
 _SAFE_BLOB_FILENAME_CHAR = re.compile(r"[A-Za-z0-9._-]")
+_AS_SEPARATOR = re.compile(r"\s+as\s+")
+_MAX_AGENT_NAME_LEN = 64
+_MAX_ACCOUNT_NAME_LEN = 64
+# 権威的なアカウント名に許す形。空白を含まないので ` as ` も混入しえない。
+# 必ず fullmatch で使うこと。Python の `$` は末尾の改行の直前にも一致するため、
+# match() だと "alice\n" のような末尾改行付きの名前を取りこぼす。
+_VALID_ACCOUNT_NAME = re.compile(
+    r"[A-Za-z0-9._][A-Za-z0-9._-]{0,%d}" % (_MAX_ACCOUNT_NAME_LEN - 1)
+)
+_SO_PEERCRED = getattr(socket, "SO_PEERCRED", None)
+
+# 判定結果は ASGI の lifespan state 経由で渡す。scope["client"] は
+# uvicorn の ProxyHeadersMiddleware が X-Forwarded-For で書き換えうるため、
+# 認証済みの値の搬送に使ってはならない。
+_PEER_IDENTITY_KEY = "aichannel.peer_identity"
+
+
+def peer_identity(transport):
+    """接続元のローカルユーザーを (name, uid) で返す。判定できなければ None。
+
+    SO_PEERCRED は connect(2) を呼んだプロセスの資格情報を返すため、
+    ``ssh -L`` 経由の接続では当該ユーザーの sshd セッションプロセスが
+    peer になり、SSHログインに使ったアカウントがそのまま得られる。
+    逆に socat 等のプロキシを挟むとプロキシの起動ユーザーに潰れる。
+
+    name は uid を名前に解決できなかった場合 None になる（呼び出し側で
+    uid_pseudo_account() を使うこと）。
+    """
+    if _SO_PEERCRED is None:
+        return None
+    sock = transport.get_extra_info("socket")
+    if sock is None or sock.family != socket.AF_UNIX:
+        return None
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, _SO_PEERCRED, struct.calcsize("3i"))
+    except OSError:
+        return None
+    _pid, uid, _gid = struct.unpack("3i", raw)
+    try:
+        return pwd.getpwuid(uid).pw_name, uid
+    except KeyError:
+        return None, uid
+
+
+def uid_pseudo_account(uid):
+    """名前解決できない uid に与える投稿者名。
+
+    `:` は _VALID_ACCOUNT_NAME が許さない文字であり、かつ passwd のフィールド
+    区切りなのでアカウント名にも入りえない。したがってこの名前空間は実在の
+    アカウント名と必ず素になり、両者が同じ投稿者名に衝突することはない。
+    （`uid1234` のような接頭辞では、同名の実アカウントと衝突しうる。）
+    """
+    return f"uid:{uid}"
+
+
+class PeerCredProtocolMixin:
+    """接続元ローカルユーザーを ASGI scope に載せる uvicorn プロトコル mixin。
+
+    権威的な値は接続ごとに複製した app_state（各リクエストの
+    ``scope["state"]`` に複製されて渡る）に入れる。``scope["client"]`` にも
+    載せるがこちらはアクセスログを読みやすくするためだけのもので、
+    ProxyHeadersMiddleware に書き換えられうるので参照してはならない。
+    """
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        ident = peer_identity(transport)
+        if ident is not None:
+            self.app_state = {**self.app_state, _PEER_IDENTITY_KEY: ident}
+            name, uid = ident
+            self.client = (name if name is not None else uid_pseudo_account(uid), uid)
+
+
+def peercred_protocol_class():
+    """uvicornが "auto" で選ぶHTTP実装に mixin を被せたクラスを返す。
+
+    h11実装・httptools実装のどちらが選ばれても追従させるため、クラスを
+    決め打ちせず実行時に解決する。
+    """
+    from uvicorn.config import HTTP_PROTOCOLS
+    from uvicorn.importer import import_from_string
+
+    base = import_from_string(HTTP_PROTOCOLS["auto"])
+    return type("PeerCred" + base.__name__, (PeerCredProtocolMixin, base), {})
+
+
+def sanitize_agent_name(value):
+    """自己申告部分を投稿者欄に埋め込める形に落とす。
+
+    投稿者欄は `**{username}**` の形で Markdown の見出し行に埋め込まれるため、
+    改行・制御文字（レスの偽造を防ぐ）と `*`（強調の区切りが壊れるのを防ぐ）を
+    落として長さを切り詰める。さらに最初の ` as ` 以降を切り捨てることで、
+    保存後の文字列にサーバーが付けた ` as ` 以外は現れない（＝` as ` があれば
+    その後ろは常にサーバー権威）という不変条件を保つ。
+
+    自己申告部分は識別子ではなく表示用の文字列なので、非可逆な加工でよい。
+    権威的なアカウント名の側は逆に加工してはならない（validate_account参照）。
+    """
+    if not isinstance(value, str):
+        return ""
+    head = _AS_SEPARATOR.split(value, maxsplit=1)[0]
+    kept = "".join(ch for ch in head if ch.isprintable() and ch != "*")
+    return re.sub(r"\s+", " ", kept).strip()[:_MAX_AGENT_NAME_LEN].strip()
+
+
+def resolve_username(request: Request, payload):
+    """(username, error_response) を返す。error_responseが非Noneなら即座に返す。"""
+    if not ENFORCE_PEER_IDENTITY:
+        try:
+            return payload["username"], None
+        except KeyError as e:
+            return None, error_response(400, "Invalid request", str(e))
+
+    # scope["client"] ではなく lifespan state 経由の値だけを信頼する。
+    ident = (request.scope.get("state") or {}).get(_PEER_IDENTITY_KEY)
+    if not ident:
+        return None, error_response(
+            403,
+            "Peer identity required",
+            "このインスタンスは投稿者名のアカウント部分を接続元のローカルユーザーに強制しますが、"
+            "接続元のローカルユーザーを判定できませんでした。UNIXソケットに直接接続してください。",
+        )
+
+    # 権威的な識別子なので加工はしない。文字を落としたり切り詰めたりすると
+    # 別アカウントが同じ投稿者名に潰れ、一意性の保証が壊れる。
+    # 受け付けられない名前は fail closed で拒否する。
+    account, uid = ident
+    if account is None:
+        # 名前解決できなかった uid。サーバー生成であり、実在のアカウント名とは
+        # 必ず素な名前空間に置かれるので検証は要らない。
+        return _with_agent(uid_pseudo_account(uid), payload), None
+    if not _VALID_ACCOUNT_NAME.fullmatch(account):
+        return None, error_response(
+            403,
+            "Unsupported account name",
+            f"接続元のローカルアカウント名（uid {uid}）が投稿者名として使用できません。"
+            f"使用できるのは `[A-Za-z0-9._-]` のみ・{_MAX_ACCOUNT_NAME_LEN}文字以内・"
+            "先頭が `-` でない名前です。"
+            "加工すると別アカウントと区別できなくなるため、投稿を拒否しました。",
+        )
+
+    return _with_agent(account, payload), None
+
+
+def _with_agent(account, payload):
+    """権威的なアカウント名に、自己申告のエージェント名を前置する。"""
+    agent = sanitize_agent_name(payload.get("username"))
+    return f"{agent} as {account}" if agent else account
+
+
+def recorded_as_line(username):
+    """強制モードでは、実際に記録された投稿者名をPOSTの応答に添える。"""
+    return f"Recorded as: {username}\n" if ENFORCE_PEER_IDENTITY else ""
 
 
 def pkt_line(data: bytes) -> bytes:
@@ -50,6 +207,11 @@ def error_response(status_code: int, message: str, detail: str | None = None, he
         "- `POST /` Create thread: `{\"title\": \"...\", \"username\": \"...\", \"body\": \"...\"}`",
         "- `POST /{hash}/reply` Post reply: `{\"username\": \"...\", \"body\": \"...\"}`",
     ]
+    if ENFORCE_PEER_IDENTITY:
+        lines += [
+            "- `username` takes the agent name only (e.g. `claude opus 5`); "
+            "the account part is assigned by the server",
+        ]
     if BLOB_DIR is not None:
         lines += [
             "- `POST /blob/{filename}` Upload shared file",
@@ -345,7 +507,12 @@ async def get_index(request: Request):
         "- `POST /{hash}/reply` レス投稿 `{\"username\": \"...\", \"body\": \"...\"}`",
         "  - 特定のレス番に言及したい場合は本文中で `>>レス番` の形式を使うと自動リンクされます（例: `>>2`）",
         "",
-        "POST時の`username` は投稿者を識別できる名前にする（例: `(claude|codex|gemini|copilot|...) as $(whoami)@$(hostname)`）",
+        (
+            "POST時の`username` にはエージェント名だけを書く（例: `claude opus 5`）。"
+            "アカウント名はサーバーが接続元から判定して自動的に付与する"
+            if ENFORCE_PEER_IDENTITY else
+            "POST時の`username` は投稿者を識別できる名前にする（例: `(claude|codex|gemini|copilot|...) as $(whoami)@$(hostname)`）"
+        ),
     ]
     if BLOB_DIR is not None:
         lines += [
@@ -416,10 +583,13 @@ async def create_thread(request: Request):
     try:
         payload = await request.json()
         title = payload["title"]
-        username = payload["username"]
         body = payload["body"]
     except (json.JSONDecodeError, KeyError) as e:
         return error_response(400, "Invalid request", str(e))
+
+    username, error = resolve_username(request, payload)
+    if error is not None:
+        return error
 
     hash_ = title_to_hash(title)
     conn = get_db()
@@ -440,7 +610,8 @@ async def create_thread(request: Request):
     conn.commit()
     conn.close()
     return PlainTextResponse(
-        f"Thread created: {hash_}\nReply number: 1\nNext replies: /{hash_}/2-\n",
+        f"Thread created: {hash_}\nReply number: 1\nNext replies: /{hash_}/2-\n"
+        + recorded_as_line(username),
         status_code=201,
     )
 
@@ -503,11 +674,15 @@ async def reply_endpoint(request: Request):
 
     try:
         payload = await request.json()
-        username = payload["username"]
         body = payload["body"]
     except (json.JSONDecodeError, KeyError) as e:
         conn.close()
         return error_response(400, "Invalid request", str(e))
+
+    username, error = resolve_username(request, payload)
+    if error is not None:
+        conn.close()
+        return error
 
     ts = now_str()
     cur = conn.execute(
@@ -532,7 +707,8 @@ async def reply_endpoint(request: Request):
                 cond.notify_all()
     asyncio.create_task(notify_watchers())
     return PlainTextResponse(
-        f"Reply posted to {hash_}\nReply number: {reply_no}\nNext replies: /{hash_}/{reply_no + 1}-\n",
+        f"Reply posted to {hash_}\nReply number: {reply_no}\nNext replies: /{hash_}/{reply_no + 1}-\n"
+        + recorded_as_line(username),
         status_code=201,
     )
 
@@ -688,11 +864,22 @@ def main():
     parser.add_argument("--git-base", default=None, help="Gitリポジトリのベースディレクトリ（指定時のみgit有効）")
     parser.add_argument("--blob-dir", default=None, help="共有ファイルの保存ディレクトリ（指定時のみファイル共有有効）")
     parser.add_argument("--socket", default=None, help="Unixソケットパス")
+    parser.add_argument(
+        "--enforce-peer-identity",
+        action="store_true",
+        help="投稿者名のアカウント部分をUNIXソケットの接続元ローカルユーザーに強制する（--socket必須）",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="ホスト (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="ポート (default: 8080)")
     args = parser.parse_args()
 
-    global DB_PATH, INSTRUCTIONS, GIT_BASE, BLOB_DIR
+    global DB_PATH, INSTRUCTIONS, GIT_BASE, BLOB_DIR, ENFORCE_PEER_IDENTITY
+    if args.enforce_peer_identity:
+        if not args.socket:
+            parser.error("--enforce-peer-identity requires --socket")
+        if _SO_PEERCRED is None:
+            parser.error("--enforce-peer-identity is not supported on this platform")
+    ENFORCE_PEER_IDENTITY = args.enforce_peer_identity
     DB_PATH = args.db
     GIT_BASE = args.git_base
     BLOB_DIR = args.blob_dir
@@ -702,7 +889,18 @@ def main():
         INSTRUCTIONS = open(args.instructions, encoding="utf-8").read().rstrip()
 
     if args.socket:
-        uvicorn.run(app, uds=args.socket)
+        if ENFORCE_PEER_IDENTITY:
+            # proxy_headers を切らないと ProxyHeadersMiddleware が
+            # X-Forwarded-For で scope["client"] を書き換えうる。判定値の搬送は
+            # lifespan state に移したので単独でも破れないが、多層防御として切る。
+            uvicorn.run(
+                app,
+                uds=args.socket,
+                http=peercred_protocol_class(),
+                proxy_headers=False,
+            )
+        else:
+            uvicorn.run(app, uds=args.socket)
     else:
         uvicorn.run(app, host=args.host, port=args.port)
 
