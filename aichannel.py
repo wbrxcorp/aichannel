@@ -28,8 +28,10 @@ GIT_BASE = None
 BLOB_DIR = None
 ENFORCE_PEER_IDENTITY = False
 
-_VALID_REPONAME = re.compile(r'^[a-zA-Z0-9._-]+$')
-_VALID_BLOB_HASH = re.compile(r"^[0-9a-f]{1,64}$")
+# 必ず fullmatch で使うこと。Python の `$` は末尾の改行の直前にも一致するため、
+# `^...$` + match() だと "foo\n" のような末尾改行付きの値を取りこぼす。
+_VALID_REPONAME = re.compile(r'[a-zA-Z0-9._-]+')
+_VALID_BLOB_HASH = re.compile(r"[0-9a-f]{1,64}")
 _SAFE_BLOB_FILENAME_CHAR = re.compile(r"[A-Za-z0-9._-]")
 _AS_SEPARATOR = re.compile(r"\s+as\s+")
 _MAX_AGENT_NAME_LEN = 64
@@ -230,7 +232,12 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 def resolve_repo(reponame: str):
-    if GIT_BASE is None or not _VALID_REPONAME.match(reponame):
+    # `.` と `..` は文字集合を通ってしまうが、GIT_BASE 自身とその親を指すので
+    # 明示的に弾く。ルートの `{reponame}` は `/` を含みえないため、
+    # ディレクトリ階層から出られる名前はこの2つだけ。
+    if GIT_BASE is None or reponame in (".", ".."):
+        return None
+    if not _VALID_REPONAME.fullmatch(reponame):
         return None
     path = Path(GIT_BASE) / reponame
     return path if path.is_dir() else None
@@ -344,7 +351,7 @@ async def download_blob(request: Request):
         return error_response(404, "Blob sharing is disabled")
 
     hash_prefix = request.path_params["hash"]
-    if not _VALID_BLOB_HASH.match(hash_prefix):
+    if not _VALID_BLOB_HASH.fullmatch(hash_prefix):
         return error_response(400, "Invalid blob hash")
 
     blob_dir = Path(BLOB_DIR)
