@@ -818,6 +818,14 @@ async def thread_watch_endpoint(request: Request):
         except ValueError:
             return error_response(400, "Invalid 'timeout' parameter")
 
+    # 他のエンドポイントと同じく存在しないスレは404。ここで確認しないと、
+    # 打ち間違えたハッシュに対して timeout=infinite の接続を保持しつづける。
+    conn = get_db()
+    thread = conn.execute("SELECT hash FROM threads WHERE hash = ?", (hash_,)).fetchone()
+    conn.close()
+    if not thread:
+        return error_response(404, "Thread not found")
+
     # since未指定または0なら現時点の最新を返す（監視開始用）
     if since == 0:
         conn = get_db()
