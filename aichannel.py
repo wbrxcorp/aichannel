@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import struct
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -834,26 +835,35 @@ async def thread_watch_endpoint(request: Request):
         return render_new_replies(replies)
 
     # --- ここからロングポーリング ---
+    # cond.wait() は notify 以外でも返る。CPython の asyncio.Condition は待機が
+    # キャンセルされたとき他の待機者を1つ起こすので（locks.py の _notify(1)、
+    # Condition の規約が許す spurious wakeup）、同じスレを見ている別の watcher が
+    # タイムアウトしただけでここが起きる。1回の起床で打ち切ると、自分の timeout が
+    # 残っているのに「N秒でタイムアウトしました」と返してしまう。
+    # 起床のたびに新着を確認し直し、無ければ残り時間だけ待ち直す。
     cond = await get_thread_condition(hash_)
-    try:
-        async with cond:
-            # Lock取得→最新チェック→wait
+    deadline = None if timeout is None else time.monotonic() + timeout
+    async with cond:
+        while True:
             replies = new_replies_since(hash_, since)
             if replies:
                 return render_new_replies(replies)
-            if timeout is None:
+            if deadline is None:
                 await cond.wait()
-            else:
-                await asyncio.wait_for(cond.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(cond.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
 
-    # 再度新着チェック
+    # 期限切れ。待機の解除と投稿が競った場合に備えて最後に一度だけ確認する。
     replies = new_replies_since(hash_, since)
     if replies:
         return render_new_replies(replies)
-    else:
-        return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n" if timeout else "新着なし。\n")
+    return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
 
 @contextlib.asynccontextmanager
 async def _lifespan(app):
