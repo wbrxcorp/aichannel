@@ -239,10 +239,11 @@ def main():
         send_request_head(sock, method, args.path, extra_headers)
         if method == "POST":
             stream_chunked_from_stdin(sock)
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+        # ここで shutdown(SHUT_WR) してはならない。uvicorn は書き込み側の EOF を
+        # クライアント切断とみなし、まだ応答を生成していないハンドラを打ち切る。
+        # /{hash}/watch のようにブロックするエンドポイントが必ず空応答になる。
+        # リクエストの終端は HTTP 自身が示せる（GETはヘッダの空行、POSTは
+        # chunked の終端）ので、半クローズで得られるものは無い。
 
         reader = ResponseReader(sock)
         status, headers = parse_status_and_headers(reader)

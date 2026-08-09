@@ -28,6 +28,9 @@ GIT_BASE = None
 BLOB_DIR = None
 ENFORCE_PEER_IDENTITY = False
 
+# sqlite3 が bind できる整数の上限。これを超える値を渡すと OverflowError になる。
+_SQLITE_MAX_INT = 2**63 - 1
+
 # 必ず fullmatch で使うこと。Python の `$` は末尾の改行の直前にも一致するため、
 # `^...$` + match() だと "foo\n" のような末尾改行付きの値を取りこぼす。
 _VALID_REPONAME = re.compile(r'[a-zA-Z0-9._-]+')
@@ -411,6 +414,13 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+    # スレのレスは常に thread_hash で絞って id 順に読む。この索引が無いと
+    # replies 全体の走査になり、watch のように繰り返し呼ばれる経路が
+    # 他スレの件数に引きずられる。
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_replies_thread_id
+            ON replies(thread_hash, id)
+    """)
     conn.commit()
     conn.close()
 
@@ -742,12 +752,60 @@ async def get_thread_condition(hash_):
         thread_watch_conditions[hash_] = cond
     return cond
 
+
+def new_replies_since(hash_, since):
+    """`since` より後のレスを (スレ内番号, 行) の列で返す。`since` は 0 以上。
+
+    番号は render_thread や `Reply number` と同じスレ内の通し番号。
+    replies.id は全スレ通しの連番なので、閾値の比較にも表示にも使ってはならない
+    （両者を取り違えると、新着が無いのに過去レスを返したり、逆に新着を
+    取りこぼしたりする）。
+
+    スレ内番号は id 順の順位そのものなので、先頭 `since` 件を OFFSET で読み飛ばせば
+    残りがそのまま新着になり、番号も `since + 1` から振り直せる。この関数は新着が
+    無いままロングポーリングから繰り返し呼ばれるため、既読分の本文まで読んでは
+    ならない（同期処理なので、スレの本文量に比例してイベントループが止まる）。
+
+    負の `since` は渡さないこと。SQLite は負の OFFSET を 0 として扱うので、
+    読み飛ばしが効かないまま番号だけ負から振られる。呼び出し側で弾く。
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT username, body, created_at FROM replies WHERE thread_hash = ? "
+        "ORDER BY id LIMIT -1 OFFSET ?",
+        (hash_, since),
+    ).fetchall()
+    conn.close()
+    return list(enumerate(rows, since + 1))
+
+
+def render_new_replies(numbered_replies):
+    lines = [f"新着レス {len(numbered_replies)}件:"]
+    for no, r in numbered_replies:
+        lines += [
+            "",
+            "---",
+            f"**{r['username']}** {r['created_at']} (#{no})",
+            r["body"],
+        ]
+    return PlainTextResponse("\n".join(lines) + "\n")
+
+
 async def thread_watch_endpoint(request: Request):
     hash_ = request.path_params["hash"]
     try:
         since = int(request.query_params.get("since", 0))
     except ValueError:
         return error_response(400, "Invalid 'since' parameter")
+    # Python の int は任意精度だが sqlite3 の bind は 64bit までなので、
+    # 検証を通した値がそのまま OFFSET に渡せることをここで保証する。
+    if since < 0 or since > _SQLITE_MAX_INT:
+        return error_response(
+            400,
+            "Invalid 'since' parameter",
+            f"'since' はすでに読んだ最新のレス番号（0以上 {_SQLITE_MAX_INT} 以下）を"
+            "指定してください。",
+        )
     timeout_str = request.query_params.get("timeout", "30")
     if timeout_str in ("infinite", "0"):
         timeout = None
@@ -759,67 +817,30 @@ async def thread_watch_endpoint(request: Request):
         except ValueError:
             return error_response(400, "Invalid 'timeout' parameter")
 
-    conn = get_db()
-    # 最新リプライ番号を取得
-    row = conn.execute(
-        "SELECT COUNT(*) FROM replies WHERE thread_hash = ?",
-        (hash_,)
-    ).fetchone()
-    latest_no = row[0] if row else 0
-    conn.close()
-
     # since未指定または0なら現時点の最新を返す（監視開始用）
     if since == 0:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM replies WHERE thread_hash = ?",
+            (hash_,)
+        ).fetchone()
+        latest_no = row[0] if row else 0
+        conn.close()
         return PlainTextResponse(f"現時点の最新リプライ番号: {latest_no}\n以降の新着を監視します")
 
     # すでに新着があれば即返す
-    if latest_no > since:
-        # 新着レスを全件取得
-        conn = get_db()
-        replies = conn.execute(
-            "SELECT id, username, body, created_at FROM replies WHERE thread_hash = ? AND id > ? ORDER BY id",
-            (hash_, since)
-        ).fetchall()
-        conn.close()
-        lines = [f"新着レス {len(replies)}件:"]
-        for r in replies:
-            lines += [
-                "",
-                f"---",
-                f"**{r['username']}** {r['created_at']} (#{r['id']})",
-                r["body"],
-            ]
-        return PlainTextResponse("\n".join(lines) + "\n")
+    replies = new_replies_since(hash_, since)
+    if replies:
+        return render_new_replies(replies)
 
     # --- ここからロングポーリング ---
     cond = await get_thread_condition(hash_)
     try:
         async with cond:
             # Lock取得→最新チェック→wait
-            conn = get_db()
-            row = conn.execute(
-                "SELECT COUNT(*) FROM replies WHERE thread_hash = ?",
-                (hash_,)
-            ).fetchone()
-            latest_no2 = row[0] if row else 0
-            conn.close()
-            if latest_no2 > since:
-                # 新着があれば即返す
-                conn = get_db()
-                replies = conn.execute(
-                    "SELECT id, username, body, created_at FROM replies WHERE thread_hash = ? AND id > ? ORDER BY id",
-                    (hash_, since)
-                ).fetchall()
-                conn.close()
-                lines = [f"新着レス {len(replies)}件:"]
-                for r in replies:
-                    lines += [
-                        "",
-                        f"---",
-                        f"**{r['username']}** {r['created_at']} (#{r['id']})",
-                        r["body"],
-                    ]
-                return PlainTextResponse("\n".join(lines) + "\n")
+            replies = new_replies_since(hash_, since)
+            if replies:
+                return render_new_replies(replies)
             if timeout is None:
                 await cond.wait()
             else:
@@ -828,22 +849,9 @@ async def thread_watch_endpoint(request: Request):
         return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n")
 
     # 再度新着チェック
-    conn = get_db()
-    replies = conn.execute(
-        "SELECT id, username, body, created_at FROM replies WHERE thread_hash = ? AND id > ? ORDER BY id",
-        (hash_, since)
-    ).fetchall()
-    conn.close()
+    replies = new_replies_since(hash_, since)
     if replies:
-        lines = [f"新着レス {len(replies)}件:"]
-        for r in replies:
-            lines += [
-                "",
-                f"---",
-                f"**{r['username']}** {r['created_at']} (#{r['id']})",
-                r["body"],
-            ]
-        return PlainTextResponse("\n".join(lines) + "\n")
+        return render_new_replies(replies)
     else:
         return PlainTextResponse(f"新着なし。{timeout}秒でタイムアウトしました。リトライしてください。\n" if timeout else "新着なし。\n")
 
